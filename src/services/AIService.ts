@@ -1,4 +1,4 @@
-import Config from 'react-native-config';
+import { CONFIG } from '../config';
 import { DiagnosticTroubleCode, AIResponse, ChatMessage, VehicleInfo, LiveData } from '../types';
 
 interface OpenAIResponse {
@@ -11,10 +11,10 @@ interface OpenAIResponse {
 
 export class AIService {
   private apiKey: string;
-  private baseURL = 'https://api.openai.com/v1';
+  private baseURL = CONFIG.OPENAI_BASE_URL;
 
   constructor() {
-    this.apiKey = Config.OPENAI_API_KEY || '';
+    this.apiKey = CONFIG.OPENAI_API_KEY;
   }
 
   // Explain a diagnostic trouble code using AI

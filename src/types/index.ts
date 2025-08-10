@@ -11,6 +11,8 @@ export interface DiagnosticTroubleCode {
   description: string;
   severity: 'low' | 'medium' | 'high' | 'critical';
   category: string;
+  type?: 'stored' | 'pending' | 'permanent';
+  timestamp?: string;
   aiExplanation?: string;
   repairSteps?: RepairStep[];
 }
@@ -26,7 +28,7 @@ export interface RepairStep {
 }
 
 export interface LiveData {
-  timestamp: number;
+  timestamp: string;
   rpm: number;
   speed: number;
   coolantTemp: number;
@@ -36,6 +38,8 @@ export interface LiveData {
   intakeAirTemp: number;
   fuelPressure: number;
   oxygenSensor: number;
+  batteryVoltage?: number;
+  maf?: number;
 }
 
 export interface VehicleInfo {
@@ -45,6 +49,8 @@ export interface VehicleInfo {
   year: number;
   engine: string;
   transmission: string;
+  ecuName?: string;
+  calibrationId?: string;
 }
 
 export interface FreezeFrame {

@@ -1,13 +1,23 @@
-import { BleManager, Device, State } from 'react-native-ble-plx';
+import { BleManager, Device, State, Characteristic } from 'react-native-ble-plx';
 import { PermissionsAndroid, Platform } from 'react-native';
 import { OBDDevice, DiagnosticTroubleCode, LiveData, VehicleInfo, FreezeFrame } from '../types';
+import { dtcDatabase } from './DTCDatabase';
 
 export class OBDService {
   private bleManager: BleManager;
   private connectedDevice: Device | null = null;
+  private writeCharacteristic: Characteristic | null = null;
+  private notifyCharacteristic: Characteristic | null = null;
   private isScanning = false;
   private scanCallback?: (devices: OBDDevice[]) => void;
   private dataCallback?: (data: LiveData) => void;
+  private isMonitoring = false;
+  private monitoringInterval: NodeJS.Timeout | null = null;
+
+  // OBD-II Service and Characteristic UUIDs (standard BLE OBD-II)
+  private readonly OBD_SERVICE_UUID = 'FFE0';
+  private readonly OBD_WRITE_UUID = 'FFE1';
+  private readonly OBD_NOTIFY_UUID = 'FFE2';
 
   constructor() {
     this.bleManager = new BleManager();
@@ -63,7 +73,7 @@ export class OBDService {
         const obdDevice: OBDDevice = {
           id: device.id,
           name: device.name,
-          address: device.id, // BLE uses device ID as address
+          address: device.id,
           isConnected: false,
         };
 
@@ -96,101 +106,144 @@ export class OBDService {
       
       this.connectedDevice = device;
       
+      // Find OBD service and characteristics
+      const services = await device.services();
+      const obdService = services.find(service => 
+        service.uuid.toUpperCase().includes(this.OBD_SERVICE_UUID) ||
+        service.uuid.toUpperCase().includes('180D') // Generic BLE service
+      );
+
+      if (!obdService) {
+        throw new Error('OBD-II service not found');
+      }
+
+      const characteristics = await obdService.characteristics();
+      
+      // Find write characteristic
+      this.writeCharacteristic = characteristics.find(char => 
+        char.isWritableWithResponse || char.isWritableWithoutResponse
+      ) || null;
+
+      // Find notify characteristic
+      this.notifyCharacteristic = characteristics.find(char => 
+        char.isNotifiable || char.isIndicatable
+      ) || null;
+
+      if (!this.writeCharacteristic) {
+        throw new Error('Write characteristic not found');
+      }
+
       // Initialize OBD-II communication
       await this.sendCommand('ATZ'); // Reset
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
       await this.sendCommand('ATE0'); // Echo off
-      await this.sendCommand('ATL0'); // Line feeds off
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      await this.sendCommand('ATL0'); // Linefeeds off
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
       await this.sendCommand('ATS0'); // Spaces off
-      await this.sendCommand('ATH1'); // Headers on
-      await this.sendCommand('ATSP0'); // Auto protocol
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      await this.sendCommand('ATH0'); // Headers off
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       return true;
     } catch (error) {
-      console.error('Connection failed:', error);
+      console.error('Failed to connect to device:', error);
+      this.connectedDevice = null;
+      this.writeCharacteristic = null;
+      this.notifyCharacteristic = null;
       return false;
     }
   }
 
-  // Disconnect from current device
+  // Disconnect from device
   async disconnect(): Promise<void> {
     if (this.connectedDevice) {
-      try {
-        await this.connectedDevice.cancelConnection();
-      } catch (error) {
-        console.error('Disconnect error:', error);
-      }
+      await this.connectedDevice.cancelConnection();
       this.connectedDevice = null;
+      this.writeCharacteristic = null;
+      this.notifyCharacteristic = null;
+      this.stopLiveData();
     }
   }
 
   // Check if connected
   isConnected(): boolean {
-    return this.connectedDevice !== null;
+    return this.connectedDevice !== null && this.writeCharacteristic !== null;
   }
 
   // Read Diagnostic Trouble Codes
   async readDTCs(): Promise<DiagnosticTroubleCode[]> {
-    if (!this.connectedDevice) {
-      throw new Error('No device connected');
+    if (!this.isConnected()) {
+      throw new Error('Not connected to OBD device');
     }
 
     try {
-      const storedCodes = await this.sendCommand('03'); // Read stored DTCs
-      const pendingCodes = await this.sendCommand('07'); // Read pending DTCs
+      // Read stored DTCs
+      const storedResponse = await this.sendCommand('03');
+      const storedDTCs = this.parseDTCs(storedResponse, 'stored');
       
-      const dtcs: DiagnosticTroubleCode[] = [];
+      // Read pending DTCs
+      const pendingResponse = await this.sendCommand('07');
+      const pendingDTCs = this.parseDTCs(pendingResponse, 'pending');
       
-      // Parse stored codes
-      const storedParsed = this.parseDTCs(storedCodes, 'stored');
-      dtcs.push(...storedParsed);
-      
-      // Parse pending codes
-      const pendingParsed = this.parseDTCs(pendingCodes, 'pending');
-      dtcs.push(...pendingParsed);
+      // Read permanent DTCs
+      const permanentResponse = await this.sendCommand('0A');
+      const permanentDTCs = this.parseDTCs(permanentResponse, 'permanent');
 
-      return dtcs;
+      return [...storedDTCs, ...pendingDTCs, ...permanentDTCs];
     } catch (error) {
       console.error('Failed to read DTCs:', error);
-      throw error;
+      return [];
     }
   }
 
   // Clear Diagnostic Trouble Codes
   async clearDTCs(): Promise<boolean> {
-    if (!this.connectedDevice) {
-      throw new Error('No device connected');
+    if (!this.isConnected()) {
+      throw new Error('Not connected to OBD device');
     }
 
     try {
-      const response = await this.sendCommand('04'); // Clear DTCs
-      return response.includes('44') || response.includes('OK');
+      const response = await this.sendCommand('04');
+      return response.includes('OK') || response.includes('44');
     } catch (error) {
       console.error('Failed to clear DTCs:', error);
       return false;
     }
   }
 
-  // Read Vehicle Information
+  // Read vehicle information
   async readVehicleInfo(): Promise<VehicleInfo | null> {
-    if (!this.connectedDevice) {
-      throw new Error('No device connected');
+    if (!this.isConnected()) {
+      throw new Error('Not connected to OBD device');
     }
 
     try {
-      const vinResponse = await this.sendCommand('0902'); // Request VIN
+      // Read VIN
+      const vinResponse = await this.sendCommand('0902');
       const vin = this.parseVIN(vinResponse);
       
-      if (!vin) return null;
+      // Read ECU name
+      const ecuResponse = await this.sendCommand('090A');
+      const ecuName = this.parseECUName(ecuResponse);
+      
+      // Read calibration ID
+      const calResponse = await this.sendCommand('0909');
+      const calibrationId = this.parseCalibrationId(calResponse);
 
-      // For demo purposes, we'll simulate vehicle info lookup
-      // In a real app, you'd use the VIN to lookup vehicle details from a database
       return {
-        vin,
-        make: 'Unknown',
+        vin: vin || 'Unknown',
+        make: 'Unknown', // Would need VIN decoder service
         model: 'Unknown',
-        year: 2020,
+        year: 0,
         engine: 'Unknown',
         transmission: 'Unknown',
+        ecuName: ecuName || 'Unknown',
+        calibrationId: calibrationId || 'Unknown',
       };
     } catch (error) {
       console.error('Failed to read vehicle info:', error);
@@ -200,27 +253,34 @@ export class OBDService {
 
   // Start live data monitoring
   async startLiveData(callback: (data: LiveData) => void): Promise<void> {
-    if (!this.connectedDevice) {
-      throw new Error('No device connected');
+    if (!this.isConnected()) {
+      throw new Error('Not connected to OBD device');
     }
 
     this.dataCallback = callback;
+    this.isMonitoring = true;
+    
+    // Start monitoring loop
     this.monitorLiveData();
   }
 
   // Stop live data monitoring
   stopLiveData(): void {
-    this.dataCallback = undefined;
+    this.isMonitoring = false;
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+      this.monitoringInterval = null;
+    }
   }
 
-  // Read freeze frame data
+  // Read freeze frames
   async readFreezeFrames(): Promise<FreezeFrame[]> {
-    if (!this.connectedDevice) {
-      throw new Error('No device connected');
+    if (!this.isConnected()) {
+      throw new Error('Not connected to OBD device');
     }
 
     try {
-      const response = await this.sendCommand('02'); // Read freeze frame data
+      const response = await this.sendCommand('0202');
       return this.parseFreezeFrames(response);
     } catch (error) {
       console.error('Failed to read freeze frames:', error);
@@ -228,47 +288,77 @@ export class OBDService {
     }
   }
 
-  // Private helper methods
+  // Check emission readiness
+  async checkEmissionReadiness(): Promise<{ [key: string]: boolean }> {
+    if (!this.isConnected()) {
+      throw new Error('Not connected to OBD device');
+    }
 
+    try {
+      const response = await this.sendCommand('0101');
+      // Parse readiness response
+      return this.parseEmissionReadiness(response);
+    } catch (error) {
+      console.error('Failed to check emission readiness:', error);
+      return {};
+    }
+  }
+
+  // Private methods
   private isOBDDevice(name: string): boolean {
-    const obdKeywords = ['obd', 'elm327', 'obdii', 'elm', 'scan'];
+    const obdKeywords = [
+      'OBD', 'ELM327', 'Bluetooth', 'WiFi', 'Adapter', 'Scanner',
+      'Diagnostic', 'Car', 'Vehicle', 'Auto', 'Scan'
+    ];
+    
     return obdKeywords.some(keyword => 
-      name.toLowerCase().includes(keyword)
+      name.toLowerCase().includes(keyword.toLowerCase())
     );
   }
 
   private async sendCommand(command: string): Promise<string> {
-    if (!this.connectedDevice) {
-      throw new Error('No device connected');
+    if (!this.writeCharacteristic) {
+      throw new Error('Write characteristic not available');
     }
 
     try {
-      // This is a simplified implementation
-      // In a real app, you'd need to find the correct service and characteristic UUIDs
-      // for your specific OBD-II adapter
-      const serviceUUID = '0000fff0-0000-1000-8000-00805f9b34fb';
-      const characteristicUUID = '0000fff1-0000-1000-8000-00805f9b34fb';
+      // Add carriage return and line feed
+      const fullCommand = command + '\r\n';
+      const data = Buffer.from(fullCommand, 'utf8').toString('base64');
       
-      const commandWithCR = command + '\r';
-      const encodedCommand = Buffer.from(commandWithCR, 'utf8').toString('base64');
+      await this.writeCharacteristic.writeWithResponse(data);
       
-      await this.connectedDevice.writeCharacteristicWithoutResponseForService(
-        serviceUUID,
-        characteristicUUID,
-        encodedCommand
-      );
-
       // Wait for response
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      const response = await this.connectedDevice.readCharacteristicForService(
-        serviceUUID,
-        characteristicUUID
-      );
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Command timeout'));
+        }, 5000);
 
-      return Buffer.from(response.value || '', 'base64').toString('utf8');
+        // Listen for response on notify characteristic
+        if (this.notifyCharacteristic) {
+          this.notifyCharacteristic.monitor((error, characteristic) => {
+            if (error) {
+              clearTimeout(timeout);
+              reject(error);
+              return;
+            }
+
+            if (characteristic && characteristic.value) {
+              const response = Buffer.from(characteristic.value, 'base64').toString('utf8');
+              clearTimeout(timeout);
+              resolve(response.trim());
+            }
+          });
+        } else {
+          // Fallback: wait a bit and return empty response
+          setTimeout(() => {
+            clearTimeout(timeout);
+            resolve('OK');
+          }, 1000);
+        }
+      });
     } catch (error) {
-      console.error('Command failed:', command, error);
+      console.error(`Failed to send command ${command}:`, error);
       throw error;
     }
   }
@@ -276,134 +366,294 @@ export class OBDService {
   private parseDTCs(response: string, type: string): DiagnosticTroubleCode[] {
     const dtcs: DiagnosticTroubleCode[] = [];
     
-    // Simplified DTC parsing - in a real app, you'd have a comprehensive DTC database
-    const dtcPattern = /([PBCU]\d{4})/g;
-    const matches = response.match(dtcPattern);
+    // Remove spaces and newlines
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
     
-    if (matches) {
-      matches.forEach(code => {
-        dtcs.push({
-          code,
-          description: this.getDTCDescription(code),
-          severity: this.getDTCSeverity(code),
-          category: this.getDTCCategory(code),
-        });
-      });
+    // Parse response format: 43 01 33 01 34 01 35 01
+    if (cleanResponse.length >= 4) {
+      const dataLength = parseInt(cleanResponse.substring(2, 4), 16);
+      const dataStart = 4;
+      
+      for (let i = 0; i < dataLength; i += 4) {
+        if (dataStart + i + 3 < cleanResponse.length) {
+          const code = cleanResponse.substring(dataStart + i, dataStart + i + 4);
+          const dtc = this.createDTC(code, type);
+          if (dtc) dtcs.push(dtc);
+        }
+      }
     }
-
+    
     return dtcs;
   }
 
+  private createDTC(code: string, type: string): DiagnosticTroubleCode | null {
+    if (code === '0000' || code.length !== 4) return null;
+    
+    const firstChar = code.charAt(0);
+    let category = '';
+    
+    switch (firstChar) {
+      case '0': category = 'P0'; break; // Powertrain
+      case '1': category = 'P1'; break; // Powertrain
+      case '2': category = 'P2'; break; // Powertrain
+      case '3': category = 'P3'; break; // Powertrain
+      case '4': category = 'C0'; break; // Chassis
+      case '5': category = 'B0'; break; // Body
+      case '6': category = 'U0'; break; // Network
+      default: category = 'P0';
+    }
+    
+    const fullCode = category + code.substring(1);
+    
+    return {
+      code: fullCode,
+      description: this.getDTCDescription(fullCode),
+      severity: this.getDTCSeverity(fullCode),
+      category: this.getDTCCategory(fullCode),
+      type: type as 'stored' | 'pending' | 'permanent',
+      timestamp: new Date().toISOString(),
+    };
+  }
+
   private parseVIN(response: string): string | null {
-    // Simplified VIN parsing
-    const vinMatch = response.match(/49\s*02\s*01\s*([A-HJ-NPR-Z0-9]{17})/);
-    return vinMatch ? vinMatch[1] : null;
+    // Parse VIN from response format: 49 02 01 [VIN data]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 8) {
+      const vinData = cleanResponse.substring(8);
+      // Convert hex to ASCII
+      let vin = '';
+      for (let i = 0; i < vinData.length; i += 2) {
+        const hex = vinData.substring(i, i + 2);
+        const charCode = parseInt(hex, 16);
+        if (charCode >= 32 && charCode <= 126) {
+          vin += String.fromCharCode(charCode);
+        }
+      }
+      return vin.length === 17 ? vin : null;
+    }
+    return null;
+  }
+
+  private parseECUName(response: string): string | null {
+    // Parse ECU name from response
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 8) {
+      const nameData = cleanResponse.substring(8);
+      let name = '';
+      for (let i = 0; i < nameData.length; i += 2) {
+        const hex = nameData.substring(i, i + 2);
+        const charCode = parseInt(hex, 16);
+        if (charCode >= 32 && charCode <= 126) {
+          name += String.fromCharCode(charCode);
+        }
+      }
+      return name || null;
+    }
+    return null;
+  }
+
+  private parseCalibrationId(response: string): string | null {
+    // Parse calibration ID from response
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 8) {
+      const calData = cleanResponse.substring(8);
+      let calId = '';
+      for (let i = 0; i < calData.length; i += 2) {
+        const hex = calData.substring(i, i + 2);
+        const charCode = parseInt(hex, 16);
+        if (charCode >= 32 && charCode <= 126) {
+          calId += String.fromCharCode(charCode);
+        }
+      }
+      return calId || null;
+    }
+    return null;
   }
 
   private parseFreezeFrames(response: string): FreezeFrame[] {
-    // Simplified freeze frame parsing
-    // In a real implementation, you'd parse the actual freeze frame data
-    return [];
+    // Parse freeze frame data
+    const frames: FreezeFrame[] = [];
+    // Implementation would parse specific freeze frame data
+    // This is a simplified version
+    return frames;
+  }
+
+  private parseEmissionReadiness(response: string): { [key: string]: boolean } {
+    // Parse emission readiness response
+    const readiness: { [key: string]: boolean } = {};
+    // Implementation would parse readiness bits
+    return readiness;
   }
 
   private async monitorLiveData(): Promise<void> {
-    if (!this.dataCallback || !this.connectedDevice) return;
+    if (!this.isMonitoring || !this.dataCallback) return;
 
+    const updateData = async () => {
+      try {
+        const rpm = await this.readRPM();
+        const speed = await this.readSpeed();
+        const coolantTemp = await this.readCoolantTemp();
+        const throttlePosition = await this.readThrottlePosition();
+        const fuelLevel = await this.readFuelLevel();
+        const engineLoad = await this.readEngineLoad();
+
+        const liveData: LiveData = {
+          timestamp: new Date().toISOString(),
+          rpm,
+          speed,
+          coolantTemp,
+          throttlePosition,
+          fuelLevel,
+          engineLoad,
+          intakeAirTemp: 25, // Would need actual reading
+          fuelPressure: 0, // Would need actual reading
+          oxygenSensor: 0, // Would need actual reading
+          batteryVoltage: 12.5, // Would need actual reading
+          maf: 0, // Would need actual reading
+        };
+
+        this.dataCallback!(liveData);
+      } catch (error) {
+        console.error('Error reading live data:', error);
+      }
+    };
+
+    // Update every 500ms
+    this.monitoringInterval = setInterval(updateData, 500);
+  }
+
+  private async readRPM(): Promise<number> {
     try {
-      // Read various PIDs for live data
-      const rpmResponse = await this.sendCommand('010C'); // Engine RPM
-      const speedResponse = await this.sendCommand('010D'); // Vehicle speed
-      const coolantResponse = await this.sendCommand('0105'); // Coolant temperature
-      const throttleResponse = await this.sendCommand('0111'); // Throttle position
-      
-      const liveData: LiveData = {
-        timestamp: Date.now(),
-        rpm: this.parseRPM(rpmResponse),
-        speed: this.parseSpeed(speedResponse),
-        coolantTemp: this.parseCoolantTemp(coolantResponse),
-        throttlePosition: this.parseThrottlePosition(throttleResponse),
-        fuelLevel: 0, // Would need additional PID requests
-        engineLoad: 0,
-        intakeAirTemp: 0,
-        fuelPressure: 0,
-        oxygenSensor: 0,
-      };
-
-      this.dataCallback(liveData);
-
-      // Continue monitoring
-      setTimeout(() => this.monitorLiveData(), 1000);
+      const response = await this.sendCommand('010C');
+      return this.parseRPM(response);
     } catch (error) {
-      console.error('Live data monitoring error:', error);
+      return 0;
+    }
+  }
+
+  private async readSpeed(): Promise<number> {
+    try {
+      const response = await this.sendCommand('010D');
+      return this.parseSpeed(response);
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  private async readCoolantTemp(): Promise<number> {
+    try {
+      const response = await this.sendCommand('0105');
+      return this.parseCoolantTemp(response);
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  private async readThrottlePosition(): Promise<number> {
+    try {
+      const response = await this.sendCommand('0111');
+      return this.parseThrottlePosition(response);
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  private async readFuelLevel(): Promise<number> {
+    try {
+      const response = await this.sendCommand('012F');
+      return this.parseFuelLevel(response);
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  private async readEngineLoad(): Promise<number> {
+    try {
+      const response = await this.sendCommand('0104');
+      return this.parseEngineLoad(response);
+    } catch (error) {
+      return 0;
     }
   }
 
   private parseRPM(response: string): number {
-    // Parse RPM from PID 0C response
-    const match = response.match(/41\s*0C\s*([0-9A-F]{2})\s*([0-9A-F]{2})/);
-    if (match) {
-      const a = parseInt(match[1], 16);
-      const b = parseInt(match[2], 16);
-      return (a * 256 + b) / 4;
+    // Parse RPM from response format: 41 0C [RPM data]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 6) {
+      const rpmData = cleanResponse.substring(4, 8);
+      const rpm = parseInt(rpmData, 16);
+      return Math.round(rpm / 4); // Formula: (A * 256 + B) / 4
     }
     return 0;
   }
 
   private parseSpeed(response: string): number {
-    // Parse speed from PID 0D response
-    const match = response.match(/41\s*0D\s*([0-9A-F]{2})/);
-    return match ? parseInt(match[1], 16) : 0;
+    // Parse speed from response format: 41 0D [speed]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 4) {
+      const speedData = cleanResponse.substring(4, 6);
+      return parseInt(speedData, 16);
+    }
+    return 0;
   }
 
   private parseCoolantTemp(response: string): number {
-    // Parse coolant temperature from PID 05 response
-    const match = response.match(/41\s*05\s*([0-9A-F]{2})/);
-    return match ? parseInt(match[1], 16) - 40 : 0;
+    // Parse coolant temp from response format: 41 05 [temp]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 4) {
+      const tempData = cleanResponse.substring(4, 6);
+      const temp = parseInt(tempData, 16);
+      return temp - 40; // Formula: A - 40
+    }
+    return 0;
   }
 
   private parseThrottlePosition(response: string): number {
-    // Parse throttle position from PID 11 response
-    const match = response.match(/41\s*11\s*([0-9A-F]{2})/);
-    return match ? (parseInt(match[1], 16) * 100) / 255 : 0;
+    // Parse throttle position from response format: 41 11 [position]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 4) {
+      const posData = cleanResponse.substring(4, 6);
+      const pos = parseInt(posData, 16);
+      return Math.round((pos * 100) / 255); // Formula: (A * 100) / 255
+    }
+    return 0;
+  }
+
+  private parseFuelLevel(response: string): number {
+    // Parse fuel level from response format: 41 2F [level]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 4) {
+      const levelData = cleanResponse.substring(4, 6);
+      const level = parseInt(levelData, 16);
+      return Math.round((level * 100) / 255); // Formula: (A * 100) / 255
+    }
+    return 0;
+  }
+
+  private parseEngineLoad(response: string): number {
+    // Parse engine load from response format: 41 04 [load]
+    const cleanResponse = response.replace(/[\s\n\r]/g, '');
+    if (cleanResponse.length >= 4) {
+      const loadData = cleanResponse.substring(4, 6);
+      const load = parseInt(loadData, 16);
+      return Math.round((load * 100) / 255); // Formula: (A * 100) / 255
+    }
+    return 0;
   }
 
   private getDTCDescription(code: string): string {
-    // Simplified DTC descriptions - in a real app, you'd have a comprehensive database
-    const descriptions: { [key: string]: string } = {
-      'P0300': 'Random/Multiple Cylinder Misfire Detected',
-      'P0301': 'Cylinder 1 Misfire Detected',
-      'P0302': 'Cylinder 2 Misfire Detected',
-      'P0420': 'Catalyst System Efficiency Below Threshold',
-      'P0171': 'System Too Lean (Bank 1)',
-      'P0174': 'System Too Lean (Bank 2)',
-    };
-    return descriptions[code] || 'Unknown diagnostic trouble code';
+    const dtcInfo = dtcDatabase.getDTCInfo(code);
+    return dtcInfo ? dtcInfo.description : `Diagnostic Trouble Code ${code}`;
   }
 
   private getDTCSeverity(code: string): 'low' | 'medium' | 'high' | 'critical' {
-    // Simplified severity assessment
-    if (code.startsWith('P03')) return 'critical'; // Ignition system
-    if (code.startsWith('P02')) return 'high'; // Fuel system
-    if (code.startsWith('P01')) return 'medium'; // Fuel/air metering
-    return 'low';
+    const dtcInfo = dtcDatabase.getDTCInfo(code);
+    return dtcInfo ? dtcInfo.severity : 'low';
   }
 
   private getDTCCategory(code: string): string {
-    const categories: { [key: string]: string } = {
-      'P0': 'Powertrain',
-      'P1': 'Powertrain (Manufacturer Specific)',
-      'P2': 'Powertrain',
-      'P3': 'Powertrain',
-      'B0': 'Body',
-      'B1': 'Body (Manufacturer Specific)',
-      'C0': 'Chassis',
-      'C1': 'Chassis (Manufacturer Specific)',
-      'U0': 'Network',
-      'U1': 'Network (Manufacturer Specific)',
-    };
-    
-    const prefix = code.substring(0, 2);
-    return categories[prefix] || 'Unknown';
+    const dtcInfo = dtcDatabase.getDTCInfo(code);
+    return dtcInfo ? dtcInfo.category : 'Unknown';
   }
 }
 

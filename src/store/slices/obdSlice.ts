@@ -196,7 +196,7 @@ const obdSlice = createSlice({
       
       // Read vehicle info
       .addCase(readVehicleInfo.fulfilled, (state, action) => {
-        state.vehicleInfo = action.payload;
+        state.vehicleInfo = action.payload || undefined;
       });
   },
 });
